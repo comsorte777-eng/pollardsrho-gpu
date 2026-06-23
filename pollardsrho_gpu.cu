@@ -84,7 +84,7 @@ __global__ void rho_walk_gpu(
                 a[i] = d_stepScalarsA[ni * 4 + i];
                 b[i] = 0;
             }
-            if (walker_type[tid] == 1) { b[0] = 1; pointAddJacobian(&R, &R, &d_target_jac); }
+            for (int i = 0; i < 4; i++) b[i] = 0; if (walker_type[tid] == 1) { b[0] = 1; pointAddJacobian(&R, &R, &d_target_jac); }
             snap_steps = 0;
             for (int i = 0; i < 4; i++) snap_x[i] = 0xFFFFFFFFFFFFFFFFULL;
             continue;
@@ -132,7 +132,7 @@ __global__ void rho_walk_gpu(
             a[i] = d_stepScalarsA[ni * 4 + i];
             b[i] = 0;
         }
-        if (walker_type[tid] == 1) { b[0] = 1; pointAddJacobian(&R, &R, &d_target_jac); }
+        for (int i = 0; i < 4; i++) b[i] = 0; if (walker_type[tid] == 1) { b[0] = 1; pointAddJacobian(&R, &R, &d_target_jac); }
     }
 
     walkers_R[tid] = R;
