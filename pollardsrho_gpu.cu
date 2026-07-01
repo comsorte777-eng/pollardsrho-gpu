@@ -9,7 +9,7 @@ extern __device__ __constant__ uint64_t ONE_MONT[4];
 #define GPU_N_STEPS     2048
 #define GPU_DP_BUF_SIZE 131072
 #define BLOCK_SIZE      256
-#define INNER_STEPS     16   // passos jacobianos entre cada batch normalize
+#define INNER_STEPS     16
 
 __device__ ECPointJacobian d_stepPoints[GPU_N_STEPS];
 __device__ uint64_t        d_stepScalarsA[GPU_N_STEPS * 4];
@@ -63,14 +63,21 @@ __global__ void rho_walk_gpu(
                       (int)num_walkers - (int)(blockIdx.x * blockDim.x));
     if (blk_n <= 0) blk_n = 1;
 
+    // Shared memory layout:
+    // smem_src [BLOCK_SIZE*4] — buffer A do Hillis-Steele
+    // smem_dst [BLOCK_SIZE*4] — buffer B do Hillis-Steele
+    // smem_Z   [BLOCK_SIZE*4] — Z originais (para back-propagation)
+    // smem_inv [BLOCK_SIZE*4] — inversos de Z resultantes
+    // smem_x   [BLOCK_SIZE*4] — x_affine resultantes
     extern __shared__ uint64_t smem[];
-    uint64_t* smem_Z   = smem;
-    uint64_t* smem_acc = smem + BLOCK_SIZE * 4;
-    uint64_t* smem_inv = smem + BLOCK_SIZE * 8;
-    uint64_t* smem_x   = smem + BLOCK_SIZE * 12;
+    uint64_t* smem_src = smem;
+    uint64_t* smem_dst = smem + BLOCK_SIZE * 4;
+    uint64_t* smem_Z   = smem + BLOCK_SIZE * 8;
+    uint64_t* smem_inv = smem + BLOCK_SIZE * 12;
+    uint64_t* smem_x   = smem + BLOCK_SIZE * 16;
 
     ECPointJacobian R;
-    uint64_t a[4] = {0,0,0,0}, b[4] = {0,0,0,0}, snap_x[4] = {0,0,0,0};
+    uint64_t a[4]={0,0,0,0}, b[4]={0,0,0,0}, snap_x[4]={0,0,0,0};
     uint64_t snap_steps = 0;
     int dp_bits  = d_dp_bits;
     uint32_t wty = 0;
@@ -95,9 +102,7 @@ __global__ void rho_walk_gpu(
 
         if (d_found) break;
 
-        // ── Fase 1: INNER_STEPS passos jacobianos puros (sem hash dependente de x_aff) ──
-        // Usa R.X que está em Montgomery com Z=ONE_MONT no início deste outer loop
-        // (garantido pelo batch normalize do outer anterior, ou do estado inicial)
+        // ── Fase 1: INNER_STEPS passos jacobianos ────────────────────────────
         for (int s = 0; s < INNER_STEPS; s++) {
             uint32_t idx = gpu_step_idx(R.X, GPU_N_STEPS);
             pointAddJacobian(&R, &R, &d_stepPoints[idx]);
@@ -112,22 +117,61 @@ __global__ void rho_walk_gpu(
             snap_steps++;
         }
 
-        // ── Fase 2: Batch normalize (1 inversão para o bloco inteiro) ───────
-        for (int j = 0; j < 4; j++) smem_Z[tid_blk*4+j] = R.Z[j];
+        // ── Fase 2: Batch normalize com Hillis-Steele paralelo ───────────────
+        //
+        // CORREÇÃO DO BUG: threads "fantasma" (tid_blk >= blk_n) usam ONE_MONT
+        // como elemento neutro da multiplicação — assim não contaminam o resultado.
+        //
+        // Hillis-Steele prefix scan:
+        //   Após log2(N) passos, src[i] = Z[0] * Z[1] * ... * Z[i]
+        //   Cada passo: dst[i] = src[i] * src[i-offset]  (se i >= offset)
+        //               dst[i] = src[i]                   (se i < offset)
+        //   Threads fantasma: dst[i] = ONE_MONT           (elemento neutro)
+
+        // 2a. Inicializa buffer: walkers ativos usam Z, fantasmas usam ONE_MONT
+        if (tid_blk < blk_n) {
+            for (int j = 0; j < 4; j++) smem_src[tid_blk*4+j] = R.Z[j];
+            for (int j = 0; j < 4; j++) smem_Z[tid_blk*4+j]   = R.Z[j]; // salva Z original
+        } else {
+            for (int j = 0; j < 4; j++) smem_src[tid_blk*4+j] = ONE_MONT[j];
+            for (int j = 0; j < 4; j++) smem_Z[tid_blk*4+j]   = ONE_MONT[j];
+        }
         __syncthreads();
 
-        if (tid_blk == 0) {
-            uint64_t tmp[4];
-            for (int j = 0; j < 4; j++) smem_acc[j] = smem_Z[j];
-            for (int i = 1; i < blk_n; i++) {
-                modMulMontP(tmp, &smem_acc[(i-1)*4], &smem_Z[i*4]);
-                for (int j = 0; j < 4; j++) smem_acc[i*4+j] = tmp[j];
+        // 2b. Hillis-Steele paralelo — TODAS as threads sempre escrevem em dst
+        for (int offset = 1; offset < BLOCK_SIZE; offset *= 2) {
+            if (tid_blk >= offset) {
+                uint64_t tmp[4];
+                modMulMontP(tmp, &smem_src[tid_blk*4], &smem_src[(tid_blk-offset)*4]);
+                for (int j = 0; j < 4; j++) smem_dst[tid_blk*4+j] = tmp[j];
+            } else {
+                for (int j = 0; j < 4; j++) smem_dst[tid_blk*4+j] = smem_src[tid_blk*4+j];
             }
+            __syncthreads();
+            // Troca src e dst
+            uint64_t* tmp_ptr = smem_src; smem_src = smem_dst; smem_dst = tmp_ptr;
+        }
+        // smem_src[i] = Z[0] * Z[1] * ... * Z[i]  para i < blk_n
+        // smem_src[i] = Z[0] * ... * Z[blk_n-1]   para i >= blk_n (neutro não altera)
+
+        // 2c. Thread 0: inversão única do produto total
+        if (tid_blk == 0) {
+            modExpMontP(&smem_inv[(blk_n-1)*4], &smem_src[(blk_n-1)*4], P_CONST_MINUS_2);
+        }
+        __syncthreads();
+
+        // 2d. Back-propagation sequencial (thread 0)
+        // cur = inv_total = 1/acc[blk_n-1]
+        // Para i = blk_n-1 downto 1:
+        //   inv_Z[i] = cur * acc[i-1]
+        //   cur = cur * Z[i]
+        // inv_Z[0] = cur
+        if (tid_blk == 0) {
             uint64_t cur[4];
-            modExpMontP(cur, &smem_acc[(blk_n-1)*4], P_CONST_MINUS_2);
+            for (int j = 0; j < 4; j++) cur[j] = smem_inv[(blk_n-1)*4+j];
             for (int i = blk_n - 1; i > 0; i--) {
                 uint64_t inv_i[4], new_cur[4];
-                modMulMontP(inv_i,   cur, &smem_acc[(i-1)*4]);
+                modMulMontP(inv_i,   cur, &smem_src[(i-1)*4]);
                 modMulMontP(new_cur, cur, &smem_Z[i*4]);
                 for (int j = 0; j < 4; j++) { smem_inv[i*4+j] = inv_i[j]; cur[j] = new_cur[j]; }
             }
@@ -135,18 +179,20 @@ __global__ void rho_walk_gpu(
         }
         __syncthreads();
 
-        uint64_t zInv2[4], x_mont[4], y_mont[4], zInv3[4];
-        modMulMontP(zInv2,  &smem_inv[tid_blk*4], &smem_inv[tid_blk*4]);
-        modMulMontP(x_mont, R.X, zInv2);
-        modMulMontP(zInv3,  zInv2, &smem_inv[tid_blk*4]);
-        modMulMontP(y_mont, R.Y, zInv3);
-        fromMontgomeryP(&smem_x[tid_blk*4], x_mont);
-
-        ECPointAffine aff;
-        for (int j = 0; j < 4; j++) aff.x[j] = smem_x[tid_blk*4+j];
-        fromMontgomeryP(aff.y, y_mont);
-        aff.infinity = 0;
-        affineToJacobian(&R, &aff);  // R.Z = ONE_MONT, R.X = toMont(x_aff)
+        // 2e. Cada thread calcula x_aff e restaura invariante Z=ONE_MONT
+        if (tid_blk < blk_n) {
+            uint64_t zInv2[4], x_mont[4], y_mont[4], zInv3[4];
+            modMulMontP(zInv2,  &smem_inv[tid_blk*4], &smem_inv[tid_blk*4]);
+            modMulMontP(x_mont, R.X, zInv2);
+            modMulMontP(zInv3,  zInv2, &smem_inv[tid_blk*4]);
+            modMulMontP(y_mont, R.Y, zInv3);
+            fromMontgomeryP(&smem_x[tid_blk*4], x_mont);
+            ECPointAffine aff;
+            for (int j = 0; j < 4; j++) aff.x[j] = smem_x[tid_blk*4+j];
+            fromMontgomeryP(aff.y, y_mont);
+            aff.infinity = 0;
+            affineToJacobian(&R, &aff);
+        }
         __syncthreads();
 
         // ── Fase 3: decisões locais (sem sync dentro) ────────────────────────
@@ -154,10 +200,10 @@ __global__ void rho_walk_gpu(
 
         bool is_cycle = (x_aff[0]==snap_x[0] && x_aff[1]==snap_x[1] &&
                          x_aff[2]==snap_x[2] && x_aff[3]==snap_x[3]);
-        bool is_dp_now = gpu_is_dp(x_aff, dp_bits) && !is_cycle;
-        bool do_restart = is_cycle || is_dp_now;
+        bool is_dp_now = active && gpu_is_dp(x_aff, dp_bits) && !is_cycle;
+        bool do_restart = active && (is_cycle || is_dp_now);
 
-        if (active && is_dp_now) {
+        if (is_dp_now) {
             uint32_t pos = atomicAdd(&d_dp_count, 1);
             if (pos < GPU_DP_BUF_SIZE) {
                 for (int i = 0; i < 4; i++) {
@@ -169,7 +215,7 @@ __global__ void rho_walk_gpu(
             }
         }
 
-        if (!do_restart) {
+        if (active && !do_restart) {
             if ((snap_steps & (snap_steps - 1)) == 0)
                 for (int i = 0; i < 4; i++) snap_x[i] = x_aff[i];
         }
@@ -186,7 +232,6 @@ __global__ void rho_walk_gpu(
                 ECPointAffine tmp; jacobianToAffine(&tmp, &R); affineToJacobian(&R, &tmp);
             }
         }
-        // se não restart, R já tem Z=ONE_MONT do batch normalize — pronto para próximo outer
 
         __syncthreads();
     }
@@ -246,7 +291,8 @@ void gpu_launch_walk(ECPointJacobian* R, uint64_t* a, uint64_t* b,
                      uint64_t* sx, uint64_t* ss, uint32_t* ty,
                      uint32_t nw, uint32_t spl, cudaStream_t st) {
     int th = BLOCK_SIZE, bl = (nw + th - 1) / th;
-    size_t smem = 4 * BLOCK_SIZE * 4 * sizeof(uint64_t);
+    // smem: src + dst + Z + inv + x = 5 * BLOCK_SIZE * 4 * 8 bytes
+    size_t smem = 5 * BLOCK_SIZE * 4 * sizeof(uint64_t);
     rho_walk_gpu<<<bl, th, smem, st>>>(R, a, b, sx, ss, ty, nw, spl);
 }
 
