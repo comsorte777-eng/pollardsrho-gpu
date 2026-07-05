@@ -3,13 +3,11 @@
 #include <device_launch_parameters.h>
 #include <stdint.h>
 
-extern __device__ __constant__ uint64_t P_CONST_MINUS_2[4];
 extern __device__ __constant__ uint64_t ONE_MONT[4];
 
 #define GPU_N_STEPS     2048
 #define GPU_DP_BUF_SIZE 131072
 #define BLOCK_SIZE      256
-#define INNER_STEPS     16
 
 __device__ ECPointJacobian d_stepPoints[GPU_N_STEPS];
 __device__ uint64_t        d_stepScalarsA[GPU_N_STEPS * 4];
@@ -46,6 +44,54 @@ __device__ __forceinline__ bool gpu_exceeds_max(const uint64_t* a, const uint64_
     return true;
 }
 
+// ── Inversão modular otimizada para secp256k1 p ───────────────────────────────
+// Cadeia verificada numericamente. Custo: ~270 ops vs 505 do genérico.
+// p-2 estrutura: [223 ones][0][22 ones][0000][1][0][11][0][1]
+//
+// SQR(r,a) = modMulMontP(r, a, a) — usa multiplicação (sem modSqrMontP)
+// MUL(r,a,b) = modMulMontP(r, a, b)
+
+__device__ __forceinline__ void field_inv(uint64_t* r, const uint64_t* a) {
+    uint64_t x2[4], x3[4], x6[4], x9[4], x11[4], x22[4];
+    uint64_t x44[4], x88[4], x176[4], x220[4], x223[4], t[4], tmp[4];
+
+    #define SQR(r,x)      modMulMontP(r, x, x)
+    #define MUL(r,x,y)    modMulMontP(r, x, y)
+    #define SQRN(r,x,n)   { modMulMontP(r,x,x); for(int _=1;_<(n);_++) modMulMontP(r,r,r); }
+    #define CPY(r,x)      for(int _=0;_<4;_++) r[_]=x[_]
+
+    // Pré-computa blocos de uns
+    SQR(tmp, a);          MUL(x2,  tmp,  a);       // x2  = a^(2^2-1)  = a^3
+    SQR(tmp, x2);         MUL(x3,  tmp,  a);       // x3  = a^(2^3-1)  = a^7
+    SQRN(tmp, x3, 3);     MUL(x6,  tmp,  x3);      // x6  = a^(2^6-1)
+    SQRN(tmp, x6, 3);     MUL(x9,  tmp,  x3);      // x9  = a^(2^9-1)
+    SQRN(tmp, x9, 2);     MUL(x11, tmp,  x2);      // x11 = a^(2^11-1)
+    SQRN(tmp, x11, 11);   MUL(x22, tmp,  x11);     // x22 = a^(2^22-1)
+    SQRN(tmp, x22, 22);   MUL(x44, tmp,  x22);     // x44 = a^(2^44-1)
+    SQRN(tmp, x44, 44);   MUL(x88, tmp,  x44);     // x88 = a^(2^88-1)
+    SQRN(tmp, x88, 88);   MUL(x176, tmp, x88);     // x176= a^(2^176-1)
+    SQRN(tmp, x176, 44);  MUL(x220, tmp, x44);     // x220= a^(2^220-1)
+    SQRN(tmp, x220, 3);   MUL(x223, tmp, x3);      // x223= a^(2^223-1)
+
+    // Monta p-2 = [223 ones][0][22 ones][0000][1][0][11][0][1]
+    CPY(t, x223);
+    SQR(t, t);                          // bit 32 = 0
+    SQRN(tmp, t, 22); MUL(t, tmp, x22); // bits 31..10 = 22 ones
+    SQRN(t, t, 4);                      // bits 9..6 = 0000
+    SQR(tmp, t);      MUL(t, tmp, a);   // bit 5 = 1
+    SQR(t, t);                          // bit 4 = 0
+    SQRN(tmp, t, 2);  MUL(t, tmp, x2);  // bits 3..2 = 11
+    SQR(t, t);                          // bit 1 = 0
+    SQR(tmp, t);      MUL(t, tmp, a);   // bit 0 = 1
+
+    CPY(r, t);
+
+    #undef SQR
+    #undef MUL
+    #undef SQRN
+    #undef CPY
+}
+
 __global__ void rho_walk_gpu(
     ECPointJacobian* walkers_R,
     uint64_t*        walkers_a,
@@ -63,15 +109,9 @@ __global__ void rho_walk_gpu(
                       (int)num_walkers - (int)(blockIdx.x * blockDim.x));
     if (blk_n <= 0) blk_n = 1;
 
-    // Shared memory layout:
-    // smem_src [BLOCK_SIZE*4] — buffer A do Hillis-Steele
-    // smem_dst [BLOCK_SIZE*4] — buffer B do Hillis-Steele
-    // smem_Z   [BLOCK_SIZE*4] — Z originais (para back-propagation)
-    // smem_inv [BLOCK_SIZE*4] — inversos de Z resultantes
-    // smem_x   [BLOCK_SIZE*4] — x_affine resultantes
     extern __shared__ uint64_t smem[];
-    uint64_t* smem_src = smem;
-    uint64_t* smem_dst = smem + BLOCK_SIZE * 4;
+    uint64_t* smem_A   = smem;
+    uint64_t* smem_B   = smem + BLOCK_SIZE * 4;
     uint64_t* smem_Z   = smem + BLOCK_SIZE * 8;
     uint64_t* smem_inv = smem + BLOCK_SIZE * 12;
     uint64_t* smem_x   = smem + BLOCK_SIZE * 16;
@@ -95,91 +135,62 @@ __global__ void rho_walk_gpu(
         R = d_stepPoints[0];
     }
 
-    uint32_t outer_iters = steps_per_launch / INNER_STEPS;
-    if (outer_iters == 0) outer_iters = 1;
-
-    for (uint32_t outer = 0; outer < outer_iters; outer++) {
+    for (uint32_t step = 0; step < steps_per_launch; step++) {
 
         if (d_found) break;
 
-        // ── Fase 1: INNER_STEPS passos jacobianos ────────────────────────────
-        for (int s = 0; s < INNER_STEPS; s++) {
-            uint32_t idx = gpu_step_idx(R.X, GPU_N_STEPS);
-            pointAddJacobian(&R, &R, &d_stepPoints[idx]);
-            scalarAdd(a, a, &d_stepScalarsA[idx * 4]);
-            scalarAdd(b, b, &d_stepScalarsB[idx * 4]);
-            if (gpu_exceeds_max(a, d_max_scalar)) {
-                uint64_t diff[4];
-                scalarSub(diff, a, d_max_scalar);
-                for (int i = 0; i < 4; i++) a[i] = diff[i];
-                pointAddJacobian(&R, &R, &d_G_OFFSET);
-            }
-            snap_steps++;
-        }
-
-        // ── Fase 2: Batch normalize com Hillis-Steele paralelo ───────────────
-        //
-        // CORREÇÃO DO BUG: threads "fantasma" (tid_blk >= blk_n) usam ONE_MONT
-        // como elemento neutro da multiplicação — assim não contaminam o resultado.
-        //
-        // Hillis-Steele prefix scan:
-        //   Após log2(N) passos, src[i] = Z[0] * Z[1] * ... * Z[i]
-        //   Cada passo: dst[i] = src[i] * src[i-offset]  (se i >= offset)
-        //               dst[i] = src[i]                   (se i < offset)
-        //   Threads fantasma: dst[i] = ONE_MONT           (elemento neutro)
-
-        // 2a. Inicializa buffer: walkers ativos usam Z, fantasmas usam ONE_MONT
+        // ── Salva Z ───────────────────────────────────────────────────────────
         if (tid_blk < blk_n) {
-            for (int j = 0; j < 4; j++) smem_src[tid_blk*4+j] = R.Z[j];
-            for (int j = 0; j < 4; j++) smem_Z[tid_blk*4+j]   = R.Z[j]; // salva Z original
+            for (int j = 0; j < 4; j++) smem_Z[tid_blk*4+j] = R.Z[j];
         } else {
-            for (int j = 0; j < 4; j++) smem_src[tid_blk*4+j] = ONE_MONT[j];
-            for (int j = 0; j < 4; j++) smem_Z[tid_blk*4+j]   = ONE_MONT[j];
+            for (int j = 0; j < 4; j++) smem_Z[tid_blk*4+j] = ONE_MONT[j];
         }
         __syncthreads();
 
-        // 2b. Hillis-Steele paralelo — TODAS as threads sempre escrevem em dst
+        // ── Prefix scan (Hillis-Steele) ───────────────────────────────────────
+        uint64_t* src = smem_A;
+        uint64_t* dst = smem_B;
+        for (int j = 0; j < 4; j++) src[tid_blk*4+j] = smem_Z[tid_blk*4+j];
+        __syncthreads();
+
         for (int offset = 1; offset < BLOCK_SIZE; offset *= 2) {
-            if (tid_blk >= offset) {
+            if (tid_blk >= offset && tid_blk < blk_n) {
                 uint64_t tmp[4];
-                modMulMontP(tmp, &smem_src[tid_blk*4], &smem_src[(tid_blk-offset)*4]);
-                for (int j = 0; j < 4; j++) smem_dst[tid_blk*4+j] = tmp[j];
+                modMulMontP(tmp, &src[tid_blk*4], &src[(tid_blk-offset)*4]);
+                for (int j = 0; j < 4; j++) dst[tid_blk*4+j] = tmp[j];
+            } else if (tid_blk < blk_n) {
+                for (int j = 0; j < 4; j++) dst[tid_blk*4+j] = src[tid_blk*4+j];
             } else {
-                for (int j = 0; j < 4; j++) smem_dst[tid_blk*4+j] = smem_src[tid_blk*4+j];
+                for (int j = 0; j < 4; j++) dst[tid_blk*4+j] = ONE_MONT[j];
             }
             __syncthreads();
-            // Troca src e dst
-            uint64_t* tmp_ptr = smem_src; smem_src = smem_dst; smem_dst = tmp_ptr;
+            uint64_t* t = src; src = dst; dst = t;
         }
-        // smem_src[i] = Z[0] * Z[1] * ... * Z[i]  para i < blk_n
-        // smem_src[i] = Z[0] * ... * Z[blk_n-1]   para i >= blk_n (neutro não altera)
 
-        // 2c. Thread 0: inversão única do produto total
+        // ── Thread 0: inversão otimizada (~270 ops vs 505) ───────────────────
         if (tid_blk == 0) {
-            modExpMontP(&smem_inv[(blk_n-1)*4], &smem_src[(blk_n-1)*4], P_CONST_MINUS_2);
+            field_inv(&smem_inv[(blk_n-1)*4], &src[(blk_n-1)*4]);
         }
         __syncthreads();
 
-        // 2d. Back-propagation sequencial (thread 0)
-        // cur = inv_total = 1/acc[blk_n-1]
-        // Para i = blk_n-1 downto 1:
-        //   inv_Z[i] = cur * acc[i-1]
-        //   cur = cur * Z[i]
-        // inv_Z[0] = cur
+        // ── Back-propagation sequencial ───────────────────────────────────────
         if (tid_blk == 0) {
             uint64_t cur[4];
             for (int j = 0; j < 4; j++) cur[j] = smem_inv[(blk_n-1)*4+j];
             for (int i = blk_n - 1; i > 0; i--) {
                 uint64_t inv_i[4], new_cur[4];
-                modMulMontP(inv_i,   cur, &smem_src[(i-1)*4]);
+                modMulMontP(inv_i,   cur, &src[(i-1)*4]);
                 modMulMontP(new_cur, cur, &smem_Z[i*4]);
-                for (int j = 0; j < 4; j++) { smem_inv[i*4+j] = inv_i[j]; cur[j] = new_cur[j]; }
+                for (int j = 0; j < 4; j++) {
+                    smem_inv[i*4+j] = inv_i[j];
+                    cur[j] = new_cur[j];
+                }
             }
             for (int j = 0; j < 4; j++) smem_inv[j] = cur[j];
         }
         __syncthreads();
 
-        // 2e. Cada thread calcula x_aff e restaura invariante Z=ONE_MONT
+        // ── Cada thread: x_aff = fromMont(X * inv^2) ─────────────────────────
         if (tid_blk < blk_n) {
             uint64_t zInv2[4], x_mont[4], y_mont[4], zInv3[4];
             modMulMontP(zInv2,  &smem_inv[tid_blk*4], &smem_inv[tid_blk*4]);
@@ -195,13 +206,13 @@ __global__ void rho_walk_gpu(
         }
         __syncthreads();
 
-        // ── Fase 3: decisões locais (sem sync dentro) ────────────────────────
+        // ── Decisões locais ───────────────────────────────────────────────────
         uint64_t* x_aff = &smem_x[tid_blk * 4];
 
-        bool is_cycle = (x_aff[0]==snap_x[0] && x_aff[1]==snap_x[1] &&
-                         x_aff[2]==snap_x[2] && x_aff[3]==snap_x[3]);
+        bool is_cycle = active && (x_aff[0]==snap_x[0] && x_aff[1]==snap_x[1] &&
+                                   x_aff[2]==snap_x[2] && x_aff[3]==snap_x[3]);
         bool is_dp_now = active && gpu_is_dp(x_aff, dp_bits) && !is_cycle;
-        bool do_restart = active && (is_cycle || is_dp_now);
+        bool do_restart = is_cycle || is_dp_now;
 
         if (is_dp_now) {
             uint32_t pos = atomicAdd(&d_dp_count, 1);
@@ -216,8 +227,19 @@ __global__ void rho_walk_gpu(
         }
 
         if (active && !do_restart) {
+            snap_steps++;
             if ((snap_steps & (snap_steps - 1)) == 0)
                 for (int i = 0; i < 4; i++) snap_x[i] = x_aff[i];
+            uint32_t idx = gpu_step_idx(x_aff, GPU_N_STEPS);
+            pointAddJacobian(&R, &R, &d_stepPoints[idx]);
+            scalarAdd(a, a, &d_stepScalarsA[idx * 4]);
+            scalarAdd(b, b, &d_stepScalarsB[idx * 4]);
+            if (gpu_exceeds_max(a, d_max_scalar)) {
+                uint64_t diff[4];
+                scalarSub(diff, a, d_max_scalar);
+                for (int i = 0; i < 4; i++) a[i] = diff[i];
+                pointAddJacobian(&R, &R, &d_G_OFFSET);
+            }
         }
 
         if (do_restart) {
@@ -291,7 +313,6 @@ void gpu_launch_walk(ECPointJacobian* R, uint64_t* a, uint64_t* b,
                      uint64_t* sx, uint64_t* ss, uint32_t* ty,
                      uint32_t nw, uint32_t spl, cudaStream_t st) {
     int th = BLOCK_SIZE, bl = (nw + th - 1) / th;
-    // smem: src + dst + Z + inv + x = 5 * BLOCK_SIZE * 4 * 8 bytes
     size_t smem = 5 * BLOCK_SIZE * 4 * sizeof(uint64_t);
     rho_walk_gpu<<<bl, th, smem, st>>>(R, a, b, sx, ss, ty, nw, spl);
 }
