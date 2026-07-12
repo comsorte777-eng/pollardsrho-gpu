@@ -7,7 +7,7 @@ extern __device__ __constant__ uint64_t ONE_MONT[4];
 
 #define GPU_N_STEPS     2048
 #define GPU_DP_BUF_SIZE 131072
-#define BLOCK_SIZE      256
+#define BLOCK_SIZE      128
 #define WARP_SIZE       32
 
 __device__ ECPointJacobian d_stepPoints[GPU_N_STEPS];
