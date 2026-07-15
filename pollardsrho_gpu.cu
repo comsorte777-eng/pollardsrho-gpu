@@ -47,31 +47,30 @@ __device__ __forceinline__ bool gpu_exceeds_max(const uint64_t* a, const uint64_
 }
 
 __device__ __forceinline__ void field_inv(uint64_t* r, const uint64_t* a) {
-    uint64_t x2[4],x3[4],x6[4],x9[4],x11[4],x22[4];
-    uint64_t x44[4],x88[4],x176[4],x220[4],x223[4],t[4],tmp[4];
+    uint64_t x2[4],x3[4],x22[4],x44[4],x88[4],x220[4],x223[4],t[4],t2[4];
     #define S(r,x)     modMulMontP(r,x,x)
     #define M(r,x,y)   modMulMontP(r,x,y)
     #define SN(r,x,n)  {modMulMontP(r,x,x);for(int _=1;_<(n);_++)modMulMontP(r,r,r);}
     #define C(r,x)     for(int _=0;_<4;_++)r[_]=x[_]
-    S(tmp,a);       M(x2,tmp,a);
-    S(tmp,x2);      M(x3,tmp,a);
-    SN(tmp,x3,3);   M(x6,tmp,x3);
-    SN(tmp,x6,3);   M(x9,tmp,x3);
-    SN(tmp,x9,2);   M(x11,tmp,x2);
-    SN(tmp,x11,11); M(x22,tmp,x11);
-    SN(tmp,x22,22); M(x44,tmp,x22);
-    SN(tmp,x44,44); M(x88,tmp,x44);
-    SN(tmp,x88,88); M(x176,tmp,x88);
-    SN(tmp,x176,44);M(x220,tmp,x44);
-    SN(tmp,x220,3); M(x223,tmp,x3);
-    C(t,x223); S(t,t);
-    SN(tmp,t,22);   M(t,tmp,x22);
+    S(t,a);        M(x2,t,a);
+    S(t,x2);       M(x3,t,a);
+    SN(t,x3,3);    M(t,t,x3);
+    SN(t,t,3);     M(t,t,x3);
+    SN(t,t,2);     M(t,t,x2);
+    SN(x22,t,11);  M(x22,x22,t);
+    SN(x44,x22,22);M(x44,x44,x22);
+    SN(x88,x44,44);M(x88,x88,x44);
+    SN(t,x88,88);  M(t,t,x88);
+    SN(x220,t,44); M(x220,x220,x44);
+    SN(x223,x220,3);M(x223,x223,x3);
+    C(t,x223);     S(t,t);
+    SN(t2,t,22);   M(t,t2,x22);
     SN(t,t,4);
-    S(tmp,t);       M(t,tmp,a);
+    S(t2,t);       M(t,t2,a);
     S(t,t);
-    SN(tmp,t,2);    M(t,tmp,x2);
+    SN(t2,t,2);    M(t,t2,x2);
     S(t,t);
-    S(tmp,t);       M(t,tmp,a);
+    S(t2,t);       M(t,t2,a);
     C(r,t);
     #undef S
     #undef M
