@@ -147,13 +147,16 @@ static void init_ec(int kr) {
 }
 
 int main(int argc, char* argv[]) {
-    std::string pub; int kr=0,nw=0,dp=0;
+    std::string pub; int kr=0,nw=0,dp=0; double pmin=0.0,pmax=100.0;
     for(int i=1;i<argc;i++){
         if(!strcmp(argv[i],"--pubkey")  &&i+1<argc) pub=argv[++i];
         if(!strcmp(argv[i],"--keyrange")&&i+1<argc) kr=atoi(argv[++i]);
         if(!strcmp(argv[i],"--walkers") &&i+1<argc) nw=atoi(argv[++i]);
         if(!strcmp(argv[i],"--dp")      &&i+1<argc) dp=atoi(argv[++i]);
+        if(!strcmp(argv[i],"--pmin")    &&i+1<argc) pmin=atof(argv[++i]);
+        if(!strcmp(argv[i],"--pmax")    &&i+1<argc) pmax=atof(argv[++i]);
     }
+    if(pmin<0.0)pmin=0.0; if(pmax>100.0)pmax=100.0; if(pmin>=pmax){pmin=0.0;pmax=100.0;}
     if(pub.empty()||kr==0||nw==0){
         std::cerr<<"Uso: ./pollardsrho_gpu --pubkey <hex> --keyrange <bits> --walkers <n> [--dp <bits>]\n";
         return 1;
@@ -171,6 +174,7 @@ int main(int argc, char* argv[]) {
     std::cout<<CYAN<<"Key range : "<<RESET<<PINK<<"2^"<<kr<<"\n"<<RESET;
     std::cout<<CYAN<<"Walkers   : "<<RESET<<PINK<<nw<<"\n"<<RESET;
     std::cout<<CYAN<<"DP bits   : "<<RESET<<PINK<<dp<<"\n"<<RESET;
+    if(pmin>0.0||pmax<100.0) std::cout<<CYAN<<"Range %   : "<<RESET<<PINK<<pmin<<"% a "<<pmax<<"%\n"<<RESET;
     std::cout<<BLUE<<"-----------------------------------------------------------------------\n"<<RESET;
 
     init_ec(kr);
@@ -180,11 +184,26 @@ int main(int argc, char* argv[]) {
     affineToJacobian(&tj,&ta);
     initPreCompH(&tj,windowSize);
 
-    uint256_t lo{},hi{};
+    uint256_t lo{},hi{},full_lo{},full_hi{};
     { int lm=(kr-1)/64,bt=(kr-1)%64;
-      lo.limbs[lm]=1ULL<<bt;
-      for(int i=0;i<lm;i++) hi.limbs[i]=~0ULL;
-      hi.limbs[lm]=(bt==63)?~0ULL:(1ULL<<(bt+1))-1; }
+      full_lo.limbs[lm]=1ULL<<bt;
+      for(int i=0;i<lm;i++) full_hi.limbs[i]=~0ULL;
+      full_hi.limbs[lm]=(bt==63)?~0ULL:(1ULL<<(bt+1))-1; }
+    {
+        uint256_t rsz=sub256(full_hi,full_lo);
+        auto frac_mul=[&](uint256_t r,double frac)->uint256_t{
+            uint256_t res{}; double carry=0.0;
+            for(int i=0;i<4;i++){
+                double v=(double)r.limbs[i]*frac+carry;
+                res.limbs[i]=(uint64_t)v;
+                carry=(v-(uint64_t)v)*18446744073709551616.0;
+            } return res;
+        };
+        lo=add256(full_lo,frac_mul(rsz,pmin/100.0));
+        hi=add256(full_lo,frac_mul(rsz,pmax/100.0));
+        if(cmp256(hi,full_hi)>0) hi=full_hi;
+        if(cmp256(lo,full_lo)<0) lo=full_lo;
+    }
 
     ECPointJacobian GO{};
     jacobianScalarMultPhi(&GO,preCompG,preCompGphi,hi.limbs,windowSize);
