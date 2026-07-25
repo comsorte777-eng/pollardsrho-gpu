@@ -156,7 +156,6 @@ int main(int argc, char* argv[]) {
         if(!strcmp(argv[i],"--pmin")    &&i+1<argc) pmin=atof(argv[++i]);
         if(!strcmp(argv[i],"--pmax")    &&i+1<argc) pmax=atof(argv[++i]);
     }
-    if(pmin<0.0)pmin=0.0; if(pmax>100.0)pmax=100.0; if(pmin>=pmax){pmin=0.0;pmax=100.0;}
     if(pub.empty()||kr==0||nw==0){
         std::cerr<<"Uso: ./pollardsrho_gpu --pubkey <hex> --keyrange <bits> --walkers <n> [--dp <bits>]\n";
         return 1;
@@ -191,16 +190,23 @@ int main(int argc, char* argv[]) {
       full_hi.limbs[lm]=(bt==63)?~0ULL:(1ULL<<(bt+1))-1; }
     {
         uint256_t rsz=sub256(full_hi,full_lo);
-        auto frac_mul=[&](uint256_t r,double frac)->uint256_t{
-            uint256_t res{}; double carry=0.0;
-            for(int i=0;i<4;i++){
-                double v=(double)r.limbs[i]*frac+carry;
-                res.limbs[i]=(uint64_t)v;
-                carry=(v-(uint64_t)v)*18446744073709551616.0;
-            } return res;
+        // Multiplicação precisa: rsz * num / 1000000 usando __uint128_t
+        // evita imprecisão de double para ranges grandes
+        auto int_frac=[&](uint256_t r, uint64_t num)->uint256_t{
+            const uint64_t den=1000000ULL;
+            uint256_t res{};
+            unsigned __int128 rem=0;
+            for(int i=3;i>=0;i--){
+                unsigned __int128 cur=((unsigned __int128)rem<<64)|(unsigned __int128)r.limbs[i];
+                res.limbs[i]=(uint64_t)((cur*num)/den);
+                rem=(cur*num)%den;
+            }
+            return res;
         };
-        lo=add256(full_lo,frac_mul(rsz,pmin/100.0));
-        hi=add256(full_lo,frac_mul(rsz,pmax/100.0));
+        uint64_t pmin_u=(uint64_t)(pmin*10000.0+0.5);
+        uint64_t pmax_u=(uint64_t)(pmax*10000.0+0.5);
+        lo=add256(full_lo,int_frac(rsz,pmin_u));
+        hi=add256(full_lo,int_frac(rsz,pmax_u));
         if(cmp256(hi,full_hi)>0) hi=full_hi;
         if(cmp256(lo,full_lo)<0) lo=full_lo;
     }
